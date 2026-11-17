@@ -87,6 +87,18 @@ tbody tr[data-selected="true"] { background: var(--accent-soft); }
 .formula { font-family: var(--font-num); font-size: 13px; line-height: 1.7; color: var(--muted); overflow-wrap: anywhere; }
 .multiples { display: flex; flex-wrap: wrap; gap: var(--s2); }
 .multiples span { font-family: var(--font-num); font-size: 12px; padding: 3px 8px; border: 1px solid var(--border); border-radius: 999px; background: var(--surface); }
+.categories { margin-top: var(--s4); padding: var(--s5); display: grid; gap: var(--s3); }
+.categories h2 { font-size: 18px; }
+.categories > p { color: var(--muted); max-width: 72ch; }
+.categories table { font-size: 13px; }
+.categories th, .categories td { padding: var(--s2) var(--s3); }
+.categories th:nth-child(n + 2), .categories td:nth-child(n + 2) { text-align: right; }
+.categories td:first-child { font-weight: 600; white-space: nowrap; }
+.categories tbody tr { cursor: default; }
+.categories tbody tr:hover { background: transparent; }
+.categories .name b { font-weight: 600; }
+.categories .name .sub { display: block; }
+.categories caption { text-align: left; padding: var(--s2) var(--s3); }
 .empty { padding: var(--s7) var(--s5); text-align: center; display: grid; gap: var(--s3); justify-items: center; }
 .empty p { color: var(--muted); }
 .button { min-height: 36px; padding: 0 var(--s4); border: 1px solid var(--border); border-radius: var(--radius-control); background: var(--surface); }

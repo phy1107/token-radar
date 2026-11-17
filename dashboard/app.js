@@ -7,6 +7,7 @@
   'use strict';
 
   var DATA = window.RADAR;
+  var CATEGORIES = window.RADAR_CATEGORIES || [];
   if (!DATA) return;
   var app = document.getElementById('board');
   var state = { q: '', category: 'all', chain: 'all', tab: 'pre-token', sort: 'implied', dir: -1, selected: null };
@@ -337,6 +338,45 @@
     );
   }
 
+  function categoryPanel() {
+    var total = CATEGORIES.reduce(function (sum, c) { return sum + c.total_implied_value_usd; }, 0);
+    var tbody = el('tbody');
+    CATEGORIES.forEach(function (c) {
+      tbody.appendChild(el('tr', null,
+        el('td', { text: c.category }),
+        el('td', { class: 'num', text: c.protocols_on_board + ' of ' + c.protocols_in_snapshot }),
+        el('td', { class: 'num', text: fmtUsd(c.total_tvl_usd) }),
+        el('td', { class: 'num ' + (c.median_change_7d === null ? '' : c.median_change_7d >= 0 ? 'pos' : 'neg'), text: fmtPct(c.median_change_7d) }),
+        el('td', { class: 'num', text: fmtUsd(c.total_implied_value_usd) }),
+        el('td', null, el('div', { class: 'name' },
+          el('b', { text: c.top_name }),
+          el('span', { class: 'sub', text: c.top_slug })
+        ))
+      ));
+    });
+    var table = CATEGORIES.length === 0
+      ? el('p', { class: 'sub', text: 'No category summary was generated for this snapshot.' })
+      : el('div', { class: 'table-wrap' },
+        el('table', null,
+          el('caption', { class: 'sub', text: 'Strongest combined implied value first. Median 7d is the middle weekly change of the category rows on the board.' }),
+          el('thead', null, el('tr', null,
+            el('th', { scope: 'col', text: 'Category' }),
+            el('th', { scope: 'col', text: 'On the board' }),
+            el('th', { scope: 'col', text: 'Combined TVL' }),
+            el('th', { scope: 'col', text: 'Median 7d' }),
+            el('th', { scope: 'col', text: 'Combined implied' }),
+            el('th', { scope: 'col', text: 'Strongest protocol' })
+          )),
+          tbody
+        )
+      );
+    return el('section', { class: 'panel categories' },
+      el('h2', { text: 'Value by category' }),
+      el('p', { class: 'sub', text: 'Each category share of the board, from the same snapshot figures as the ranking. Together the categories hold ' + fmtUsd(total) + ' of implied value.' }),
+      table
+    );
+  }
+
   var dialog = el('dialog', { class: 'detail', id: 'detail', 'aria-labelledby': 'detail-title' });
   dialog.addEventListener('close', function () { state.selected = null; writeHash(); });
 
@@ -393,7 +433,7 @@
     shell.appendChild(lede());
     shell.appendChild(controls());
     shell.appendChild(state.tab === 'pre-token' ? boardTable() : liveTable());
-    if (state.tab === 'pre-token') shell.appendChild(modelPanel());
+    if (state.tab === 'pre-token') { shell.appendChild(modelPanel()); shell.appendChild(categoryPanel()); }
     app.appendChild(shell);
     app.setAttribute('aria-busy', 'false');
     if (!dialog.isConnected) app.appendChild(dialog);

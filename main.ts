@@ -12,6 +12,7 @@ import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, statSyn
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { boardIssue, buildRadar, dataScript, parseSnapshot } from './lib/model.ts';
+import { categorySummaries } from './lib/stats.ts';
 import { buildDossier } from './vendor/makefun-board.ts';
 
 const here = fileURLToPath(new URL('.', import.meta.url));
@@ -46,7 +47,8 @@ if (issue !== null) fail(`the model wrote a board the gate refuses: ${issue}`);
 
 mkdirSync(out, { recursive: true });
 writeFileSync(join(out, 'board.json'), `${JSON.stringify({ rows: board })}\n`);
-writeFileSync(join(out, 'data.js'), dataScript(radar));
+const categories = categorySummaries(radar.rows, snapshot.protocols);
+writeFileSync(join(out, 'data.js'), dataScript(radar) + `window.RADAR_CATEGORIES=${JSON.stringify(categories)};\n`);
 
 /** Copy one directory's regular files into `to`, skipping dot-names. */
 function copyFiles(from: string, to: string): string[] {
