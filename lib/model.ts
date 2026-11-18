@@ -1,4 +1,4 @@
-// Token Radar, model radar-2.
+// Token Radar, model radar-3.
 //
 // One snapshot in, one ranked board out. The board is the 40 watchlist
 // protocols plus every other pre-token protocol below the watchlist floor
@@ -9,9 +9,12 @@
 //
 //   multiple   = the category's median market-cap / TVL among the
 //                snapshot's live-token protocols (at least 4 of them),
-//                else the global median over all live-token protocols,
-//                clamped to 0.08..0.60. It is computed at run time from
-//                the snapshot, never written in by hand.
+//                else that median shrunk toward the global median,
+//                weight live_n / (live_n + 4), so a category with one
+//                live comp counts it for a fifth and a category with
+//                none takes the global median; clamped to 0.08..0.60.
+//                It is computed at run time from the snapshot, never
+//                written in by hand.
 //   growth     = 1 + 0.55 * tanh(clamp(change_7d, -70, 300) / 60)
 //                A seven-day print is a noisy week, so it is dampened:
 //                a +4448% week and a +60% week end up close, and a
@@ -57,6 +60,8 @@ export interface ModelConstants {
   multiple_floor: number;
   multiple_cap: number;
   multiple_min_live: number;
+  /** Pseudo-observations of the global median a thin category is shrunk by. */
+  multiple_prior: number;
   growth_weight: number;
   growth_scale: number;
   growth_floor: number;
@@ -72,6 +77,7 @@ export const MODEL: ModelConstants = {
   multiple_floor: 0.08,
   multiple_cap: 0.6,
   multiple_min_live: 4,
+  multiple_prior: 4,
   growth_weight: 0.55,
   growth_scale: 60,
   growth_floor: -70,
@@ -83,7 +89,7 @@ export const MODEL: ModelConstants = {
   product_discount: 0.5,
 };
 
-export const MODEL_VERSION = 'radar-2';
+export const MODEL_VERSION = 'radar-3';
 
 /** How many early (below-floor) rows the board carries at most. */
 export const EARLY_ROWS = 200;
@@ -120,6 +126,7 @@ export interface BoardRow {
     maturity_multiplier: number;
     product_discount: number;
     age_days: number | null;
+    multiple_live_n: number;
   };
   farm_steps: string[];
 }
@@ -138,9 +145,11 @@ export interface RadarRow {
   implied_value_usd: number;
   watchlist: boolean;
   multiple: number;
+  multiple_live_n: number;
   growth_multiplier: number;
   maturity_multiplier: number;
   product_discount: number;
+  farm_steps: string[];
 }
 
 export interface LiveRow {
@@ -164,7 +173,7 @@ export interface RadarData {
   board_size: number;
   early_size: number;
   live_size: number;
-  multiples: Record<string, number>;
+  multiples: Record<string, CategoryMultiple>;
   global_multiple: number;
   rows: RadarRow[];
   live: LiveRow[];
@@ -227,13 +236,33 @@ export function isRankable(p: SnapshotProtocol): boolean {
   return isPreToken(p) && p.category !== 'CEX' && !VERSIONED.test(p.name);
 }
 
+/** One category's value multiple, with the evidence behind it. */
+export interface CategoryMultiple {
+  multiple: number;
+  /** Live-token protocols in this category with a usable market-cap / TVL. */
+  live_n: number;
+  /** The category's own median market-cap / TVL, or null when it has none. */
+  raw_median: number | null;
+}
+
+export interface Multiples {
+  byCategory: Record<string, CategoryMultiple>;
+  global: number;
+}
+
 /**
  * The value multiple for every category, computed from the snapshot's
- * live-token protocols: each category with enough live protocols gets
- * its own median market-cap / TVL; the rest share the global median.
- * Both are clamped, so one wild outlier cannot set the multiple.
+ * live-token protocols. A category with enough live protocols (at least
+ * multiple_min_live) takes its own median market-cap / TVL, clamped.
+ * A thinner category does not have its own evidence thrown away for the
+ * global median, and a single wild comp does not set the board either:
+ * its clamped median is shrunk toward the global median, weight
+ * live_n / (live_n + multiple_prior), so one live comp counts for a
+ * fifth of the answer and three count for under half. A category with
+ * no live comp at all takes the global median. Both are clamped, so one
+ * wild outlier cannot set the multiple.
  */
-export function categoryMultiples(snapshot: Snapshot, model: ModelConstants = MODEL): { byCategory: Record<string, number>; global: number } {
+export function categoryMultiples(snapshot: Snapshot, model: ModelConstants = MODEL): Multiples {
   const byCategory = new Map<string, number[]>();
   const all: number[] = [];
   for (const p of snapshot.protocols) {
@@ -248,25 +277,40 @@ export function categoryMultiples(snapshot: Snapshot, model: ModelConstants = MO
     }
   }
   const global = all.length > 0 ? clamp(median(all), model.multiple_floor, model.multiple_cap) : 0.25;
-  const out: Record<string, number> = {};
+  const out: Record<string, CategoryMultiple> = {};
   for (const [category, ratios] of byCategory) {
+    const raw = median(ratios);
+    const clamped = clamp(raw, model.multiple_floor, model.multiple_cap);
     if (ratios.length >= model.multiple_min_live) {
-      out[category] = clamp(median(ratios), model.multiple_floor, model.multiple_cap);
+      out[category] = { multiple: round4(clamped), live_n: ratios.length, raw_median: round4(raw) };
+    } else {
+      const w = ratios.length / (ratios.length + model.multiple_prior);
+      out[category] = {
+        multiple: round4(clamp(w * clamped + (1 - w) * global, model.multiple_floor, model.multiple_cap)),
+        live_n: ratios.length,
+        raw_median: round4(raw),
+      };
     }
   }
   return { byCategory: out, global };
 }
 
-export function multipleFor(p: SnapshotProtocol, multiples: { byCategory: Record<string, number>; global: number }): number {
-  if (p.category !== null && multiples.byCategory[p.category] !== undefined) return multiples.byCategory[p.category]!;
+export function multipleFor(p: SnapshotProtocol, multiples: Multiples): number {
+  if (p.category !== null && multiples.byCategory[p.category] !== undefined) return multiples.byCategory[p.category]!.multiple;
   return multiples.global;
+}
+
+/** How many live-token comps stand behind a protocol's multiple, 0 when it is the global median alone. */
+export function multipleLiveN(p: SnapshotProtocol, multiples: Multiples): number {
+  if (p.category !== null && multiples.byCategory[p.category] !== undefined) return multiples.byCategory[p.category]!.live_n;
+  return 0;
 }
 
 /** The multipliers and implied value one protocol gets. */
 export function impliedValue(
   protocol: SnapshotProtocol,
   asOf: string,
-  multiples: { byCategory: Record<string, number>; global: number },
+  multiples: Multiples,
   model: ModelConstants = MODEL,
 ): { implied: number; multiple: number; growthPct: number; growthMult: number; maturityMult: number; discount: number; age: number | null } {
   const age = ageDays(asOf, protocol.listed_at);
@@ -330,6 +374,7 @@ export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): B
       maturity_multiplier: round4(s.maturityMult),
       product_discount: s.discount,
       age_days: s.age,
+      multiple_live_n: multipleLiveN(s.p, multiples),
     },
     farm_steps: farmSteps(s.p, s.age).map(stepText),
   }));
@@ -361,37 +406,227 @@ function holdDaysFor(age: number | null): number {
   return 30;
 }
 
-function actionFor(p: SnapshotProtocol, capital: number, chain: string): string {
+/**
+ * One category's farm playbook: the main action, a second action that
+ * shows a different side of the protocol, and a diligence check that
+ * only makes sense for that kind of protocol. `{name}` is the protocol,
+ * `{chain}` its first chain, `{capital}` the suggested capital in
+ * dollars and `{small}` a fifth of it. The table is matched on the
+ * snapshot's own category string, most specific first, so a new
+ * category falls through to the generic playbook instead of breaking.
+ */
+interface Playbook {
+  keys: string[];
+  action: string;
+  second: string;
+  check: string;
+}
+
+const PLAYBOOKS: Playbook[] = [
+  {
+    keys: ['risk curator'],
+    action: 'Allocate ${capital} into a {name} curator vault on {chain} and keep the shares.',
+    second: 'Allocate ${small} to a second curator vault on {name} run by a different curator, so the wallet is spread across two managers.',
+    check: "Compare the two curators' fees and 30-day vault returns on {name}'s own page, and move the smaller allocation to the better one.",
+  },
+  {
+    keys: ['onchain capital allocator'],
+    action: 'Deposit ${capital} into a {name} vault on {chain} and keep the shares.',
+    second: 'Deposit ${small} into a second {name} vault with a different strategy, so the wallet shows more than one allocation.',
+    check: "Read {name}'s strategy note for each vault and check its largest holding, so the allocation is one you understand.",
+  },
+  {
+    keys: ['collateral markets'],
+    action: 'Supply ${capital} of USDC as collateral to a {name} market on {chain} and keep the position open.',
+    second: 'Borrow ${small} against the collateral on {name} and repay it within the week, so the account shows both sides of the market.',
+    check: "Check the market's utilisation and borrow rate on {name}'s own page, and top the collateral up if utilisation is above 80%.",
+  },
+  {
+    keys: ['cdp'],
+    action: 'Lock ${capital} of collateral on {name} on {chain} and mint its stable asset, keeping the collateral ratio above 150%.',
+    second: 'Repay ${small} of the minted stable asset on {name}, so the account shows both minting and repaying.',
+    check: "Check the collateral ratio on {name}'s own page, and top the collateral up if the ratio falls toward liquidation.",
+  },
+  {
+    keys: ['uncollateralized lending', 'lending'],
+    action: 'Supply ${capital} of USDC to {name} on {chain} and keep the position open.',
+    second: 'Borrow ${small} against the deposit on {name} and repay it within the week, so the account shows both sides of the market.',
+    check: "Check the borrow rate and the collateral ratio on {name}'s own page, and repay early if the ratio falls toward liquidation.",
+  },
+  {
+    keys: ['liquid restaking'],
+    action: "Stake ${capital} of the chain's staking asset through {name} on {chain} and keep the receipt token.",
+    second: 'Deposit the receipt token into a {name} restaking pool on {chain}, so the wallet shows the restaked leg too.',
+    check: "Check the restaking yield and the withdrawal delay on {name}'s own page, and note the delay before counting on the funds.",
+  },
+  {
+    keys: ['liquid staking'],
+    action: "Stake ${capital} of the chain's staking asset through {name} on {chain} and keep the receipt token.",
+    second: 'Provide ${small} of the receipt token as liquidity on {chain}, so the wallet shows the staked asset working twice.',
+    check: "Check the staking APR and the receipt token's peg to the staked asset on {name}'s own page, and unstake if the peg slips.",
+  },
+  {
+    keys: ['staking pool', 'restaking', 'staking'],
+    action: "Stake ${capital} of the chain's staking asset through {name} and keep the receipt.",
+    second: 'Claim the staking rewards on {name} once and restake them, so the account shows a full reward cycle.',
+    check: "Check the reward rate and the unbonding period on {name}'s own page, and claim only from the link it publishes.",
+  },
+  {
+    keys: ['leveraged farm'],
+    action: "Open a leveraged farm of ${capital} on {name} on {chain} at its lowest leverage, and keep the position open.",
+    second: 'Reduce the leverage on the {name} farm by a third after the first week, so the account shows active risk management.',
+    check: "Check the liquidation price and the borrow rate on {name}'s own page every week, and close the farm if the rate doubles.",
+  },
+  {
+    keys: ['liquidity manager'],
+    action: "Deposit ${capital} into a {name} managed liquidity position on {chain} and keep the position open.",
+    second: "Move the {name} position to the pool it marks as its highest-fee pool on {chain}, so the wallet shows a rebalance.",
+    check: "Check the position's fee earnings and impermanent loss on {name}'s own page, and withdraw if fees stop covering the loss.",
+  },
+  {
+    keys: ['yield aggregator'],
+    action: "Deposit ${capital} into {name}'s highest-yield vault on {chain} and keep the shares.",
+    second: 'Claim the vault yield on {name} once and redeposit it, so the account shows a full compounding cycle.',
+    check: "Compare {name}'s vault APYs on its own page and move the deposit if another vault pays a third more for the same asset.",
+  },
+  {
+    keys: ['indexes', 'index'],
+    action: 'Buy ${capital} of the {name} index token on {chain} and hold it.',
+    second: 'Check the index rebalance on {name} and add ${small} after a rebalance, so the wallet holds the new weights.',
+    check: "Read {name}'s index composition on its own page, and sell if one asset grows past half the index.",
+  },
+  {
+    keys: ['dex', 'yield'],
+    action: "Provide ${capital} of liquidity to {name}'s main pool on {chain} and keep the position open.",
+    second: "Swap ${small} through {name}'s main pool on {chain} once, so the wallet shows trading as well as liquidity.",
+    check: "Check the pool's volume and fee earnings on {name}'s own page, and move the liquidity if volume falls for two weeks.",
+  },
+  {
+    keys: ['farm'],
+    action: "Deposit ${capital} of USDC into {name}'s main farm on {chain} and keep the position open.",
+    second: 'Harvest the farm rewards on {name} once and redeposit them, so the account shows a full reward cycle.',
+    check: "Check the farm's emission rate and reward token price on {name}'s own page, and exit if emissions are cut in half.",
+  },
+  {
+    keys: ['canonical bridge', 'cross chain bridge', 'bridge'],
+    action: 'Bridge ${capital} of USDC to {chain} through {name} and use the bridged funds in its app.',
+    second: 'Send a second, smaller bridge of ${small} back through {name} the following week, so the route is used in both directions.',
+    check: "Check the bridge time and fee on {name}'s own page before each crossing, and never bridge during a fee spike.",
+  },
+  {
+    keys: ['basis trading'],
+    action: "Deposit ${capital} into {name}'s basis vault on {chain} and keep the shares.",
+    second: 'Check the funding rate the {name} vault earns and add ${small} when the rate is positive for a full week.',
+    check: "Read {name}'s last funding-rate report on its own page, and withdraw if the rate stays negative for two weeks.",
+  },
+  {
+    keys: ['perpetual', 'interest rate', 'derivative'],
+    action: 'Deposit ${capital} of USDC as margin on {name} and open one small hedge.',
+    second: 'Close the hedge on {name} and open a fresh one half its size, so the account shows repeated margin use.',
+    check: "Check the funding rate and the liquidation price on {name}'s own page before every trade, and keep the hedge under a tenth of the margin.",
+  },
+  {
+    keys: ['prediction'],
+    action: 'Fund ${capital} and place one market position on {name}.',
+    second: 'Close the first {name} position and open a second one on a different market, so the account shows more than one outcome.',
+    check: "Check the market's resolution rules on {name}'s own page before betting, and never risk more than the ${capital} you funded.",
+  },
+  {
+    keys: ['dual-token stablecoin', 'stablecoin wrapper', 'stable'],
+    action: 'Mint or deposit ${capital} of the stable asset through {name} on {chain}.',
+    second: 'Redeem ${small} of the stable asset back to USDC through {name}, so the account shows both minting and redeeming.',
+    check: "Check the peg and the reserve attestation on {name}'s own page, and redeem the rest if the peg slips below $0.99.",
+  },
+  {
+    keys: ['rwa'],
+    action: "Mint ${capital} of the protocol's yield asset on {chain} and hold it.",
+    second: "Check the underlying asset's custodian attestation on {name}'s own page and add ${small} only while it is current.",
+    check: "Verify the custodian and the last audit date for {name}'s underlying assets, and exit if the attestation lapses.",
+  },
+  {
+    keys: ['cedefi'],
+    action: 'Deposit ${capital} into a {name} vault on {chain} and keep the shares.',
+    second: 'Withdraw ${small} from the {name} vault and redeposit it a week later, so the account shows a full deposit cycle.',
+    check: "Check the custodian and the proof of reserves on {name}'s own page, and withdraw if the proof is more than a month old.",
+  },
+  {
+    keys: ['anchor btc', 'decentralized btc'],
+    action: 'Mint ${capital} of the BTC-backed asset through {name} on {chain} and hold it.',
+    second: 'Redeem ${small} of the BTC-backed asset through {name}, so the account shows both minting and redeeming.',
+    check: "Check the BTC custody proof on {name}'s own page, and redeem if the backing falls below one bitcoin per token.",
+  },
+  {
+    keys: ['chain'],
+    action: 'Bridge ${capital} of USDC to the {name} chain and use one native app there.',
+    second: 'Stake or delegate ${small} on the {name} chain, so the wallet shows native activity as well as the bridge.',
+    check: "Check the {name} chain's block explorer to confirm each transaction landed, and note the finality time for the next one.",
+  },
+  {
+    keys: ['governance'],
+    action: 'Lock ${capital} in {name} governance on {chain} and vote on one live proposal.',
+    second: 'Vote on a second {name} proposal the following week, so the account shows repeated governance activity.',
+    check: "Read the proposal text on {name}'s own page before voting, and never delegate the vote to an address you do not know.",
+  },
+  {
+    keys: ['payments', 'card'],
+    action: 'Load ${capital} onto {name} on {chain} and spend a small amount through it.',
+    second: 'Top {name} up by ${small} and spend it a week later, so the account shows repeated use.',
+    check: "Check the fees and the settlement time on {name}'s own page, and keep no more than ${capital} loaded at once.",
+  },
+  {
+    keys: ['insurance'],
+    action: 'Buy ${capital} of cover from {name} on {chain} and keep the policy.',
+    second: "Check the cover's expiry and claim window on {name}'s own page, and renew it before it lapses.",
+    check: "Read what {name}'s cover excludes on its own page, and keep the policy only while the exclusion list is one you accept.",
+  },
+];
+
+const GENERIC_PLAYBOOK: Playbook = {
+  keys: [],
+  action: 'Deposit ${capital} of USDC into {name} on {chain} and keep the position open.',
+  second: 'Vote or interact with one governance or rewards action on {name} on {chain}, so the wallet is not only a deposit.',
+  check: "Open {name}'s own page and check the position is counted, then read its latest update before adding more funds.",
+};
+
+/** The playbook for a protocol's own category, most specific match first. */
+function playbookFor(p: SnapshotProtocol): Playbook {
   const c = (p.category ?? '').toLowerCase();
-  const name = p.name;
-  if (c.includes('lend') || c.includes('cdp') || c.includes('collateral')) return `Supply $${capital} of USDC to ${name} on ${chain} and keep the position open.`;
-  if (c.includes('dex') || c.includes('yield') || c.includes('leveraged farm')) return `Provide $${capital} of liquidity to ${name}'s main pool on ${chain} and keep the position open.`;
-  if (c.includes('bridge')) return `Bridge $${capital} of USDC to ${chain} through ${name} and use the bridged funds in its app.`;
-  if (c.includes('staking') || c.includes('restak')) return `Stake $${capital} of the chain's staking asset through ${name} and keep the receipt.`;
-  if (c.includes('perpetual') || c.includes('derivative')) return `Deposit $${capital} of USDC as margin on ${name} and open one small hedge.`;
-  if (c.includes('prediction')) return `Fund $${capital} and place one market position on ${name}.`;
-  if (c.includes('curator') || c.includes('allocator')) return `Deposit $${capital} into a ${name} vault on ${chain} and keep the shares.`;
-  if (c.includes('stable')) return `Mint or deposit $${capital} of the stable asset through ${name} on ${chain}.`;
-  if (c.includes('rwa')) return `Mint $${capital} of the protocol's yield asset on ${chain} and hold it.`;
-  if (c.includes('insurance')) return `Buy $${capital} of cover from ${name} on ${chain} and keep the policy.`;
-  return `Deposit $${capital} of USDC into ${name} on ${chain} and keep the position open.`;
+  for (const book of PLAYBOOKS) {
+    if (book.keys.some((k) => c.includes(k))) return book;
+  }
+  return GENERIC_PLAYBOOK;
+}
+
+/** Fill a playbook template's placeholders for one protocol. */
+function fill(template: string, p: SnapshotProtocol, capital: number, chain: string): string {
+  const small = Math.max(10, Math.round(capital / 5));
+  return template
+    .replaceAll('{name}', p.name)
+    .replaceAll('{chain}', chain)
+    .replaceAll('{capital}', String(capital))
+    .replaceAll('{small}', String(small));
+}
+
+function actionFor(p: SnapshotProtocol, capital: number, chain: string): string {
+  return fill(playbookFor(p).action, p, capital, chain);
 }
 
 function secondActionFor(p: SnapshotProtocol, capital: number, chain: string): string {
-  const c = (p.category ?? '').toLowerCase();
-  const name = p.name;
-  if (c.includes('lend') || c.includes('cdp') || c.includes('collateral')) return `Borrow $${Math.max(10, Math.round(capital / 5))} against the deposit on ${name} and repay it within the week, so the account shows both sides of the market.`;
-  if (c.includes('dex') || c.includes('yield')) return `Swap $${Math.max(10, Math.round(capital / 5))} through ${name}'s main pool on ${chain} once, so the wallet shows trading as well as liquidity.`;
-  if (c.includes('bridge')) return `Send a second, smaller bridge of $${Math.max(10, Math.round(capital / 5))} back through ${name} the following week, so the route is used in both directions.`;
-  if (c.includes('perpetual') || c.includes('derivative')) return `Close the hedge on ${name} and open a fresh one half its size, so the account shows repeated margin use.`;
-  if (c.includes('staking') || c.includes('restak')) return `Claim the staking rewards on ${name} once and restake them, so the account shows a full reward cycle.`;
-  return `Vote or interact with one governance or rewards action on ${name} on ${chain}, so the wallet is not only a deposit.`;
+  return fill(playbookFor(p).second, p, capital, chain);
+}
+
+function diligenceFor(p: SnapshotProtocol, capital: number, chain: string): string {
+  return fill(playbookFor(p).check, p, capital, chain);
 }
 
 /**
- * A protocol's farm plan: seven steps, each an action with a cost and a
+ * A protocol's farm plan: eight steps, each an action with a cost and a
  * time. The plan is derived from the protocol's own record (category,
- * chains, TVL, age), never from a hand-written list of names.
+ * chains, TVL, age), never from a hand-written list of names: the
+ * playbook picks the main action, the second action and the diligence
+ * check from the category, and the capital and the hold from the TVL
+ * and the age. The dashboard renders these same steps from data.js,
+ * so the page and board.json agree by construction.
  */
 export function farmSteps(p: SnapshotProtocol, age: number | null): FarmStep[] {
   const chain = chainOf(p);
@@ -399,11 +634,13 @@ export function farmSteps(p: SnapshotProtocol, age: number | null): FarmStep[] {
   const hold = holdDaysFor(age);
   const action = actionFor(p, capital, chain);
   const second = secondActionFor(p, capital, chain);
+  const check = diligenceFor(p, capital, chain);
   const gas = capital >= 150 ? 8 : 4;
   return [
     { text: `Use a fresh wallet that holds only the funds you plan to farm, and keep its seed phrase offline.`, cost: 'under $3 of gas for the first transaction', time: '5 minutes' },
     { text: action, cost: `$${capital} of capital and about $${gas} of gas`, time: '15 minutes to set up' },
     { text: second, cost: `about $${gas} of gas, no new capital`, time: '10 minutes' },
+    { text: check, cost: 'no fee to check', time: '15 minutes' },
     { text: `Make one qualifying action each week, such as a deposit, a borrow, a swap or a vote.`, cost: 'about $2 of gas a week', time: '10 minutes a week' },
     { text: `Hold the position for at least ${hold} days so the activity is counted in more than one snapshot.`, cost: `the $${capital} stays in the position`, time: `${hold} days` },
     { text: `Each week, open the protocol's own points or rewards page and check the position is counted; claim only from the link it publishes.`, cost: 'no fee to check, and never pay to claim', time: '10 minutes a week' },
@@ -444,9 +681,11 @@ export function radarRow(row: BoardRow): RadarRow {
     implied_value_usd: row.implied_value_usd,
     watchlist: row.watchlist,
     multiple: row.model.multiple,
+    multiple_live_n: row.model.multiple_live_n,
     growth_multiplier: row.model.growth_multiplier,
     maturity_multiplier: row.model.maturity_multiplier,
     product_discount: row.model.product_discount,
+    farm_steps: row.farm_steps,
   };
 }
 

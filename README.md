@@ -8,7 +8,7 @@ A token launch radar: ranks pre-token protocols by implied value from DefiLlama 
 
 ## Model
 
-Implied value = TVL x category median market-cap/TVL multiple (computed at run time, clamped 0.08-0.60) x growth factor from 7-day change x maturity factor from age with no token x 0.5 discount for wrapped/staked/bridged products; live-token protocols are shown apart, never ranked; 226 rows (all 40 watchlist + 186 early pre-token protocols).
+Implied value = TVL x category median market-cap/TVL multiple (computed at run time, clamped 0.08-0.60; thin categories are shrunk toward the global median instead of losing their own evidence) x growth factor from 7-day change x maturity factor from age with no token x 0.5 discount for wrapped/staked/bridged products; live-token protocols are shown apart, never ranked; 226 rows (all 40 watchlist + 186 early pre-token protocols). Each row carries an 8-step farm plan from a per-category playbook, and the dashboard renders those same steps from data.js, so the page and board.json agree.
 
 ## Run it
 
